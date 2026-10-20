@@ -1,0 +1,484 @@
+"""
+ICCT Free Student Counseling - Schedule Reservation System
+-----------------------------------------------------------
+Features
+  * Dark navy-purple themed GUI (tkinter / ttk, no extra installs)
+  * SQLite database (counseling.db is created automatically)
+  * Live slot availability per counselor + date (no double booking,
+    enforced both in code AND by a UNIQUE database index)
+  * Input validation (student ID, email, PH mobile number)
+  * Booking rules: weekdays only, no past slots, max 1 booking per day,
+    max 3 active bookings per student
+  * "My Bookings" lookup + cancel
+  * Admin panel (password protected): view all, mark completed/no-show,
+    search, export CSV
+Run:  python icct_counseling.py
+Default admin password: icct-admin-2026   (change ADMIN_PASSWORD_HASH below)
+"""
+
+import csv
+import hashlib
+import re
+import sqlite3
+import datetime as dt
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+
+# ----------------------------------------------------------------- CONFIG
+DB_FILE = "counseling.db"
+ADMIN_PASSWORD_HASH = hashlib.sha256(b"icct-admin-2026").hexdigest()
+
+COUNSELORS = [
+    "Ms. Santos - Guidance Counselor",
+    "Mr. Dela Cruz - Guidance Counselor",
+    "Ms. Reyes - Peer Counselor Coordinator",
+]
+CONCERNS = [
+    "Academic Stress", "Personal / Family", "Career Guidance",
+    "Anxiety / Mental Health", "Relationships", "Financial Concerns", "Others",
+]
+COURSES = ["BSIT", "BSCS", "BSBA", "BSHM", "BSOA", "BSE", "BSED", "Other"]
+YEARS = ["1st Year", "2nd Year", "3rd Year", "4th Year"]
+SLOTS = ["09:00", "10:00", "11:00", "13:00", "14:00", "15:00", "16:00"]
+DAYS_AHEAD = 14
+MAX_ACTIVE = 3
+
+# ----------------------------------------------------------------- THEME
+BG = "#0d0a2b"        # deep navy purple
+PANEL = "#171244"     # card
+PANEL_2 = "#211a5c"   # inputs / rows
+ACCENT = "#7c4dff"    # violet
+ACCENT_H = "#9d7bff"
+TEXT = "#ece8ff"
+MUTED = "#9b94cf"
+OK = "#4cd9a0"
+BAD = "#ff6b8a"
+FONT = ("Segoe UI", 10)
+FONT_B = ("Segoe UI", 10, "bold")
+FONT_H = ("Segoe UI", 20, "bold")
+
+
+# -------------------------------------------------------------- DATABASE
+class DB:
+    def __init__(self, path=DB_FILE):
+        self.con = sqlite3.connect(path)
+        self.con.row_factory = sqlite3.Row
+        self.con.execute("""
+            CREATE TABLE IF NOT EXISTS bookings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id  TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                course      TEXT NOT NULL,
+                year        TEXT NOT NULL,
+                email       TEXT NOT NULL,
+                phone       TEXT NOT NULL,
+                counselor   TEXT NOT NULL,
+                concern     TEXT NOT NULL,
+                notes       TEXT,
+                date        TEXT NOT NULL,
+                time        TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'Booked',
+                created_at  TEXT NOT NULL
+            )""")
+        # Hard guarantee: one active booking per counselor/date/time
+        self.con.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_active_slot
+            ON bookings(counselor, date, time) WHERE status = 'Booked'""")
+        self.con.commit()
+
+    def taken_slots(self, counselor, date):
+        rows = self.con.execute(
+            "SELECT time FROM bookings WHERE counselor=? AND date=? AND status='Booked'",
+            (counselor, date)).fetchall()
+        return {r["time"] for r in rows}
+
+    def active_for_student(self, sid):
+        return self.con.execute(
+            "SELECT * FROM bookings WHERE student_id=? AND status='Booked' "
+            "AND date>=? ORDER BY date, time",
+            (sid, dt.date.today().isoformat())).fetchall()
+
+    def add(self, d):
+        self.con.execute("""
+            INSERT INTO bookings (student_id,name,course,year,email,phone,counselor,
+                                  concern,notes,date,time,created_at)
+            VALUES (:student_id,:name,:course,:year,:email,:phone,:counselor,
+                    :concern,:notes,:date,:time,:created_at)""", d)
+        self.con.commit()
+
+    def by_student(self, sid):
+        return self.con.execute(
+            "SELECT * FROM bookings WHERE student_id=? ORDER BY date DESC, time DESC",
+            (sid,)).fetchall()
+
+    def all(self, q=""):
+        like = f"%{q}%"
+        return self.con.execute(
+            "SELECT * FROM bookings WHERE student_id LIKE ? OR name LIKE ? "
+            "OR counselor LIKE ? OR date LIKE ? OR status LIKE ? "
+            "ORDER BY date DESC, time DESC", (like,) * 5).fetchall()
+
+    def set_status(self, bid, status):
+        self.con.execute("UPDATE bookings SET status=? WHERE id=?", (status, bid))
+        self.con.commit()
+
+
+# ------------------------------------------------------------- VALIDATION
+def valid_student_id(s):
+    return re.fullmatch(r"\d{2}-?\d{3,6}|[A-Za-z0-9-]{5,15}", s) is not None
+
+
+def valid_email(s):
+    return re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", s) is not None
+
+
+def valid_phone(s):
+    return re.fullmatch(r"(09|\+639)\d{9}", s.replace(" ", "")) is not None
+
+
+def upcoming_weekdays(n=DAYS_AHEAD):
+    out, d = [], dt.date.today()
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d += dt.timedelta(days=1)
+    return out
+
+
+# -------------------------------------------------------------------- APP
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.db = DB()
+        self.title("ICCT Free Student Counseling - Reservation")
+        self.geometry("980x720")
+        self.minsize(900, 660)
+        self.configure(bg=BG)
+        self.admin_ok = False
+        self._style()
+        self._header()
+        self._tabs()
+        self.refresh_slots()
+
+    # ---------------------------------------------------------- styling
+    def _style(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure(".", background=BG, foreground=TEXT, font=FONT)
+        s.configure("TFrame", background=BG)
+        s.configure("Card.TFrame", background=PANEL)
+        s.configure("TLabel", background=PANEL, foreground=TEXT)
+        s.configure("Muted.TLabel", background=PANEL, foreground=MUTED)
+        s.configure("TNotebook", background=BG, borderwidth=0)
+        s.configure("TNotebook.Tab", background=PANEL, foreground=MUTED,
+                    padding=(22, 10), font=FONT_B, borderwidth=0)
+        s.map("TNotebook.Tab",
+              background=[("selected", ACCENT)],
+              foreground=[("selected", "#ffffff")])
+        for w in ("TEntry", "TCombobox"):
+            s.configure(w, fieldbackground=PANEL_2, background=PANEL_2,
+                        foreground=TEXT, insertcolor=TEXT, bordercolor=ACCENT,
+                        lightcolor=PANEL_2, darkcolor=PANEL_2, padding=6)
+        s.map("TCombobox", fieldbackground=[("readonly", PANEL_2)],
+              foreground=[("readonly", TEXT)],
+              selectbackground=[("readonly", PANEL_2)],
+              selectforeground=[("readonly", TEXT)])
+        self.option_add("*TCombobox*Listbox.background", PANEL_2)
+        self.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        s.configure("Accent.TButton", background=ACCENT, foreground="#fff",
+                    font=FONT_B, padding=(18, 10), borderwidth=0)
+        s.map("Accent.TButton", background=[("active", ACCENT_H)])
+        s.configure("Ghost.TButton", background=PANEL_2, foreground=TEXT,
+                    font=FONT, padding=(14, 8), borderwidth=0)
+        s.map("Ghost.TButton", background=[("active", "#2e2680")])
+        s.configure("Danger.TButton", background="#6a1f45", foreground="#fff",
+                    font=FONT, padding=(14, 8), borderwidth=0)
+        s.map("Danger.TButton", background=[("active", "#8c2a5c")])
+        s.configure("Treeview", background=PANEL_2, fieldbackground=PANEL_2,
+                    foreground=TEXT, rowheight=28, borderwidth=0)
+        s.configure("Treeview.Heading", background=ACCENT, foreground="#fff",
+                    font=FONT_B, borderwidth=0, padding=6)
+        s.map("Treeview", background=[("selected", ACCENT)])
+        s.configure("Vertical.TScrollbar", background=PANEL_2, troughcolor=PANEL,
+                    bordercolor=PANEL, arrowcolor=TEXT)
+
+    def _header(self):
+        h = tk.Frame(self, bg=BG)
+        h.pack(fill="x", padx=26, pady=(20, 6))
+        tk.Label(h, text="ICCT Free Student Counseling", bg=BG, fg=TEXT,
+                 font=FONT_H).pack(anchor="w")
+        tk.Label(h, text="Reserve a private, confidential session with a counselor "
+                         "- 100% free for enrolled students.",
+                 bg=BG, fg=MUTED, font=FONT).pack(anchor="w")
+
+    def _tabs(self):
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=22, pady=14)
+        self.t_book = ttk.Frame(self.nb, style="Card.TFrame")
+        self.t_mine = ttk.Frame(self.nb, style="Card.TFrame")
+        self.t_admin = ttk.Frame(self.nb, style="Card.TFrame")
+        self.nb.add(self.t_book, text="  Book a Session  ")
+        self.nb.add(self.t_mine, text="  My Bookings  ")
+        self.nb.add(self.t_admin, text="  Admin  ")
+        self._build_book()
+        self._build_mine()
+        self._build_admin()
+        self.nb.bind("<<NotebookTabChanged>>", self._tab_changed)
+
+    # ------------------------------------------------------- book tab
+    def _field(self, parent, label, row, col, widget):
+        ttk.Label(parent, text=label, style="Muted.TLabel").grid(
+            row=row * 2, column=col, sticky="w", padx=14, pady=(10, 0))
+        widget.grid(row=row * 2 + 1, column=col, sticky="ew", padx=14, pady=(2, 0))
+
+    def _build_book(self):
+        f = self.t_book
+        f.columnconfigure((0, 1), weight=1, uniform="c")
+        self.v = {k: tk.StringVar() for k in (
+            "sid", "name", "email", "phone", "course", "year",
+            "counselor", "concern", "date", "time")}
+        E = lambda var, **k: ttk.Entry(f, textvariable=var, **k)
+        C = lambda var, vals: ttk.Combobox(f, textvariable=var, values=vals,
+                                           state="readonly")
+        self._field(f, "Student ID  (e.g. 24-12345)", 0, 0, E(self.v["sid"]))
+        self._field(f, "Full Name", 0, 1, E(self.v["name"]))
+        self._field(f, "Email", 1, 0, E(self.v["email"]))
+        self._field(f, "Mobile Number  (09XXXXXXXXX)", 1, 1, E(self.v["phone"]))
+        self._field(f, "Course", 2, 0, C(self.v["course"], COURSES))
+        self._field(f, "Year Level", 2, 1, C(self.v["year"], YEARS))
+        self._field(f, "Counselor", 3, 0, C(self.v["counselor"], COUNSELORS))
+        self._field(f, "Concern Type", 3, 1, C(self.v["concern"], CONCERNS))
+
+        dates = [d.isoformat() for d in upcoming_weekdays()]
+        cd = C(self.v["date"], dates)
+        self._field(f, "Date  (weekdays only)", 4, 0, cd)
+        self.cb_time = C(self.v["time"], [])
+        self._field(f, "Available Time Slot", 4, 1, self.cb_time)
+        self.v["counselor"].trace_add("write", lambda *_: self.refresh_slots())
+        self.v["date"].trace_add("write", lambda *_: self.refresh_slots())
+
+        ttk.Label(f, text="Short note for the counselor (optional)",
+                  style="Muted.TLabel").grid(row=10, column=0, sticky="w",
+                                              padx=14, pady=(10, 0))
+        self.notes = tk.Text(f, height=3, bg=PANEL_2, fg=TEXT, insertbackground=TEXT,
+                             relief="flat", font=FONT, padx=8, pady=6)
+        self.notes.grid(row=11, column=0, columnspan=2, sticky="ew", padx=14, pady=(2, 0))
+
+        self.lbl_status = tk.Label(f, text="", bg=PANEL, fg=MUTED, font=FONT)
+        self.lbl_status.grid(row=12, column=0, columnspan=2, pady=(10, 0))
+        bar = ttk.Frame(f, style="Card.TFrame")
+        bar.grid(row=13, column=0, columnspan=2, pady=12)
+        ttk.Button(bar, text="Reserve Schedule", style="Accent.TButton",
+                   command=self.book).pack(side="left", padx=6)
+        ttk.Button(bar, text="Clear", style="Ghost.TButton",
+                   command=self.clear_form).pack(side="left", padx=6)
+
+    def refresh_slots(self):
+        c, d = self.v["counselor"].get(), self.v["date"].get()
+        if not (c and d):
+            self.cb_time["values"] = []
+            return
+        taken = self.db.taken_slots(c, d)
+        now = dt.datetime.now()
+        free = []
+        for t in SLOTS:
+            if t in taken:
+                continue
+            if d == now.date().isoformat() and t <= now.strftime("%H:%M"):
+                continue
+            free.append(t)
+        self.cb_time["values"] = free
+        if self.v["time"].get() not in free:
+            self.v["time"].set("")
+        self.lbl_status.config(
+            text=f"{len(free)} slot(s) open" if free else "Fully booked - pick another day/counselor",
+            fg=OK if free else BAD)
+
+    def clear_form(self):
+        for k, var in self.v.items():
+            var.set("")
+        self.notes.delete("1.0", "end")
+        self.lbl_status.config(text="")
+
+    def book(self):
+        d = {k: v.get().strip() for k, v in self.v.items()}
+        errs = []
+        if not valid_student_id(d["sid"]): errs.append("Invalid Student ID.")
+        if len(d["name"]) < 3: errs.append("Enter your full name.")
+        if not valid_email(d["email"]): errs.append("Invalid email address.")
+        if not valid_phone(d["phone"]): errs.append("Mobile must be 09XXXXXXXXX or +639XXXXXXXXX.")
+        for key, label in (("course", "course"), ("year", "year level"),
+                           ("counselor", "counselor"), ("concern", "concern type"),
+                           ("date", "date"), ("time", "time slot")):
+            if not d[key]: errs.append(f"Select a {label}.")
+        if errs:
+            return messagebox.showwarning("Check your details", "\n".join(errs))
+
+        active = self.db.active_for_student(d["sid"])
+        if len(active) >= MAX_ACTIVE:
+            return messagebox.showwarning(
+                "Limit reached", f"You already have {MAX_ACTIVE} active bookings. "
+                                 "Cancel or finish one first.")
+        if any(a["date"] == d["date"] for a in active):
+            return messagebox.showwarning("One per day",
+                                          "You already have a session on that date.")
+
+        record = dict(
+            student_id=d["sid"].upper(), name=d["name"].title(), course=d["course"],
+            year=d["year"], email=d["email"].lower(), phone=d["phone"].replace(" ", ""),
+            counselor=d["counselor"], concern=d["concern"],
+            notes=self.notes.get("1.0", "end").strip(), date=d["date"], time=d["time"],
+            created_at=dt.datetime.now().isoformat(timespec="seconds"))
+        try:
+            self.db.add(record)
+        except sqlite3.IntegrityError:
+            self.refresh_slots()
+            return messagebox.showerror("Slot taken",
+                                        "Someone just booked that slot. Pick another one.")
+        messagebox.showinfo(
+            "Reservation confirmed",
+            f"Name: {record['name']}\nCounselor: {record['counselor']}\n"
+            f"Date: {record['date']}   Time: {record['time']}\n\n"
+            "Please arrive 5 minutes early and bring your school ID.")
+        self.clear_form()
+
+    # ----------------------------------------------------- my bookings
+    COLS = (("id", "ID", 50), ("date", "Date", 100), ("time", "Time", 70),
+            ("counselor", "Counselor", 250), ("concern", "Concern", 170),
+            ("status", "Status", 90))
+
+    def _tree(self, parent, extra=()):
+        cols = [c[0] for c in self.COLS] + [e[0] for e in extra]
+        tv = ttk.Treeview(parent, columns=cols, show="headings", selectmode="browse")
+        for key, title, w in list(self.COLS) + list(extra):
+            tv.heading(key, text=title)
+            tv.column(key, width=w, anchor="w")
+        tv.tag_configure("Booked", foreground=OK)
+        tv.tag_configure("Cancelled", foreground=BAD)
+        tv.tag_configure("Completed", foreground=MUTED)
+        tv.tag_configure("No-show", foreground="#ffb86b")
+        return tv
+
+    def _fill(self, tv, rows, extra=()):
+        tv.delete(*tv.get_children())
+        for r in rows:
+            vals = [r[c[0]] for c in self.COLS] + [r[e[0]] for e in extra]
+            tv.insert("", "end", values=vals, tags=(r["status"],))
+
+    def _build_mine(self):
+        f = self.t_mine
+        top = ttk.Frame(f, style="Card.TFrame")
+        top.pack(fill="x", padx=14, pady=14)
+        ttk.Label(top, text="Your Student ID:").pack(side="left")
+        self.mine_sid = tk.StringVar()
+        e = ttk.Entry(top, textvariable=self.mine_sid, width=20)
+        e.pack(side="left", padx=10)
+        e.bind("<Return>", lambda _: self.load_mine())
+        ttk.Button(top, text="Find My Bookings", style="Accent.TButton",
+                   command=self.load_mine).pack(side="left")
+        ttk.Button(top, text="Cancel Selected", style="Danger.TButton",
+                   command=self.cancel_mine).pack(side="right")
+        self.tv_mine = self._tree(f)
+        self.tv_mine.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+    def load_mine(self):
+        sid = self.mine_sid.get().strip().upper()
+        if not sid:
+            return messagebox.showwarning("Required", "Enter your Student ID.")
+        rows = self.db.by_student(sid)
+        self._fill(self.tv_mine, rows)
+        if not rows:
+            messagebox.showinfo("No records", "No bookings found for that Student ID.")
+
+    def cancel_mine(self):
+        sel = self.tv_mine.selection()
+        if not sel:
+            return messagebox.showinfo("Select one", "Select a booking first.")
+        v = self.tv_mine.item(sel[0])["values"]
+        if v[5] != "Booked":
+            return messagebox.showinfo("Not allowed", "Only active bookings can be cancelled.")
+        if messagebox.askyesno("Cancel booking", f"Cancel session on {v[1]} at {v[2]}?"):
+            self.db.set_status(v[0], "Cancelled")
+            self.load_mine()
+            self.refresh_slots()
+
+    # ------------------------------------------------------------ admin
+    def _build_admin(self):
+        f = self.t_admin
+        self.admin_lock = ttk.Frame(f, style="Card.TFrame")
+        self.admin_lock.pack(expand=True)
+        ttk.Label(self.admin_lock, text="Counseling office staff only",
+                  style="Muted.TLabel").pack(pady=8)
+        ttk.Button(self.admin_lock, text="Unlock Admin Panel",
+                   style="Accent.TButton", command=self.unlock).pack()
+
+        self.admin_body = ttk.Frame(f, style="Card.TFrame")
+        top = ttk.Frame(self.admin_body, style="Card.TFrame")
+        top.pack(fill="x", padx=14, pady=14)
+        self.q = tk.StringVar()
+        e = ttk.Entry(top, textvariable=self.q, width=28)
+        e.pack(side="left")
+        e.bind("<KeyRelease>", lambda _: self.load_admin())
+        ttk.Label(top, text="  search ID / name / date / status",
+                  style="Muted.TLabel").pack(side="left")
+        for txt, st, style in (("Completed", "Completed", "Ghost.TButton"),
+                               ("No-show", "No-show", "Ghost.TButton"),
+                               ("Cancel", "Cancelled", "Danger.TButton")):
+            ttk.Button(top, text=txt, style=style,
+                       command=lambda s=st: self.admin_set(s)).pack(side="right", padx=3)
+        ttk.Button(top, text="Export CSV", style="Accent.TButton",
+                   command=self.export_csv).pack(side="right", padx=8)
+        extra = (("student_id", "Student ID", 100), ("name", "Name", 160))
+        self.tv_admin = self._tree(self.admin_body, extra)
+        self.tv_admin.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.stats = tk.Label(self.admin_body, text="", bg=PANEL, fg=MUTED, font=FONT)
+        self.stats.pack(pady=(0, 10))
+
+    def unlock(self):
+        pw = simpledialog.askstring("Admin", "Password:", show="*", parent=self)
+        if pw and hashlib.sha256(pw.encode()).hexdigest() == ADMIN_PASSWORD_HASH:
+            self.admin_ok = True
+            self.admin_lock.pack_forget()
+            self.admin_body.pack(fill="both", expand=True)
+            self.load_admin()
+        elif pw is not None:
+            messagebox.showerror("Denied", "Wrong password.")
+
+    def load_admin(self):
+        rows = self.db.all(self.q.get().strip())
+        self._fill(self.tv_admin, rows, (("student_id", ""), ("name", "")))
+        n = lambda s: sum(1 for r in rows if r["status"] == s)
+        self.stats.config(text=f"Total {len(rows)}  |  Booked {n('Booked')}  |  "
+                               f"Completed {n('Completed')}  |  Cancelled {n('Cancelled')}  |  "
+                               f"No-show {n('No-show')}")
+
+    def admin_set(self, status):
+        sel = self.tv_admin.selection()
+        if not sel:
+            return messagebox.showinfo("Select one", "Select a booking first.")
+        self.db.set_status(self.tv_admin.item(sel[0])["values"][0], status)
+        self.load_admin()
+        self.refresh_slots()
+
+    def export_csv(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            initialfile="counseling_bookings.csv",
+                                            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        rows = self.db.all("")
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            if rows:
+                w.writerow(rows[0].keys())
+                w.writerows([tuple(r) for r in rows])
+        messagebox.showinfo("Exported", f"Saved {len(rows)} records.")
+
+    def _tab_changed(self, _):
+        if self.admin_ok and self.nb.select() == str(self.t_admin):
+            self.load_admin()
+
+
+if __name__ == "__main__":
+    App().mainloop()
